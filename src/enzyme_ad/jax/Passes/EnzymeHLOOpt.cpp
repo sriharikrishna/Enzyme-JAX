@@ -2332,7 +2332,10 @@ struct GammaConstProp final : OpRewritePattern<mlir::chlo::LgammaOp> {
                                 PatternRewriter &rewriter) const override {
     // return if not constant
     DenseElementsAttr inputAttr;
+<<<<<<< HEAD
 
+=======
+>>>>>>> 58e43b6 (lgamma expansion)
     if(!matchPattern(op.getOperand(),m_Constant(&inputAttr)))
       return failure();
 
