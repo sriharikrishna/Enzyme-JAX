@@ -460,6 +460,22 @@ def LowerEnzymeXLALinalgPass : Pass<"lower-enzymexla-linalg"> {
   ];
 }
 
+def LowerEnzymeXLAMPIPass : Pass<"lower-enzymexla-mpi"> {
+  let summary = "Lower MPI Ops to LLVM";
+  let dependentDialects = [
+    "enzymexla::EnzymeXLADialect",
+    "LLVM::LLVMDialect",
+  ];
+  let options = [
+    Option<
+        /*C++ variable name=*/"backend",
+        /*CLI argument=*/"backend",
+        /*type=*/"std::string",
+        /*default=*/"\"cpu\"",
+        /*description=*/"HW backend">,
+  ];
+}
+
 def LowerEnzymeXLALapackPass : Pass<"lower-enzymexla-lapack"> {
   let summary = "Lower enzymexla.lapack ops to stablehlo";
   let dependentDialects = [
@@ -688,6 +704,12 @@ def LowerJITPass : Pass<"lower-jit"> {
         /*type=*/"bool",
         /*default=*/"true",
         /*description=*/"whether to use openmp for lowering">,
+    Option<
+        /*C++ variable name=*/"dump_final_module",
+        /*CLI argument=*/"dump_final_module",
+        /*type=*/"bool",
+        /*default=*/"false",
+        /*description=*/"whether to dump the final module before jit">,
   ];
 }
 
@@ -1156,6 +1178,14 @@ def ConvertAllConstantsToSplattedConstantPass : Pass<"convert-all-constants-to-s
   let summary = "Convert all constants to splatted constants. This is supposed to be used for debugging purposes when dumping the module.";
   let dependentDialects = [
     "stablehlo::StablehloDialect",
+  ];
+}
+
+def RemoveAtomicsPass : Pass<"remove-atomics"> {
+  let summary = "Remove unnecessary atomics";
+  let dependentDialects = [
+    "affine::AffineDialect",
+    "enzymexla::EnzymeXLADialect",
   ];
 }
 

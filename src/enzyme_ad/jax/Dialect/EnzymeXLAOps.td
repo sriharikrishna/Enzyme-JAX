@@ -353,6 +353,57 @@ def RotateOp : EnzymeXLA_Op<"rotate", [Pure, SameOperandsAndResultType]> {
   let results = (outs HLO_Tensor:$result);
 }
 
+def MultiRotateOp : EnzymeXLA_Op<"multi_rotate", [Pure]> {
+  let summary = "Produces multiple rotated versions of the input tensor";
+  let description = [{
+    MultiRotate operation produces multiple rotated versions of the input tensor.
+    Given left_amount=L and right_amount=R, it produces L+R+1 results:
+    - L results for left rotations (from L to 1)
+    - 1 result for no rotation (amount=0)
+    - R results for right rotations (from 1 to R)
+    
+    For example, with left_amount=2 and right_amount=2:
+    results[0] = rotate left by 2
+    results[1] = rotate left by 1
+    results[2] = no rotation (amount=0)
+    results[3] = rotate right by 1
+    results[4] = rotate right by 2
+  }];
+  let arguments = (ins
+    HLO_Tensor:$operand,
+    SI32Attr:$dimension,
+    SI32Attr:$left_amount,
+    SI32Attr:$right_amount
+  );
+  let results = (outs Variadic<HLO_Tensor>:$results);
+  let hasVerifier = 1;
+}
+
+def MultiSliceOp : EnzymeXLA_Op<"multi_slice", [Pure]> {
+  let summary = "Produces multiple slice versions of the input tensor";
+  let description = [{
+    MultiSlice operation produces multiple slice versions of the input tensor.
+    Given left_amount=L and right_amount=R, it produces L+R+1 results:
+    - L results for slices shifted left
+    - 1 result for the center slice
+    - R results for slices shifted right
+    
+    The slice parameters (start_indices, limit_indices, strides) define the center slice.
+    Each left/right result is offset along the specified dimension.
+  }];
+  let arguments = (ins
+    HLO_Tensor:$operand,
+    DenseI64ArrayAttr:$start_indices,
+    DenseI64ArrayAttr:$limit_indices,
+    DenseI64ArrayAttr:$strides,
+    SI32Attr:$dimension,
+    SI32Attr:$left_amount,
+    SI32Attr:$right_amount
+  );
+  let results = (outs Variadic<HLO_Tensor>:$results);
+  let hasVerifier = 1;
+}
+
 def WrapOp: EnzymeXLA_Op<
       "wrap",
       [Pure, SameOperandsAndResultElementType,
@@ -1086,6 +1137,132 @@ def AffineStoreVar : EnzymeXLA_Op<"store_var", [Pure]> {
   let arguments = (ins Variadic<AnyType>:$variables,
                        Builtin_StringAttr:$type);
   let summary = "Fake store an SSA value for conversion to ISL";
+}
+
+// MPI Ops
+
+def MPICommRankOp : EnzymeXLA_Op<"mpi.comm_rank", [Pure]> {
+  let summary = "Equivalent to " "`MPI_Comm_rank(MPI_COMM_WORLD, &rank)`";
+
+  let results = (
+    outs TensorOf<[I32]> : $rank
+  );
+
+  let assemblyFormat = "attr-dict `:` type(results)";
+}
+
+def MPICommSizeOp : EnzymeXLA_Op<"mpi.comm_size", [Pure]> {
+  let summary = "Equivalent to MPI_Comm_size(MPI_COMM_WORLD, &size)";
+
+  let results = (
+    outs TensorOf<[I32]> : $size
+  );
+
+  let assemblyFormat = "attr-dict `:` type(results)";
+}
+
+def MPIBarrierOp : EnzymeXLA_Op<"mpi.barrier", []> {
+  let summary = "Equivalent to MPI_Barrier(MPI_COMM_WORLD)";
+  let assemblyFormat = "attr-dict";
+}
+
+def MPISendOp : EnzymeXLA_Op<"mpi.send", []> {
+  let summary = "Equivalent to "
+                "`MPI_Send(&buf, count, datatype, dest, tag, comm)`";
+
+  let arguments = (
+    ins AnyTensor : $buf,
+    TensorOf<[I32]> : $count,
+    TensorOf<[I32]> : $dest,
+    TensorOf<[I32]> : $tag,
+    EnzymeXLA_MPIDatatypeAttr:$datatype
+  );
+
+  let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
+}
+
+def MPIRecvOp : EnzymeXLA_Op<"mpi.recv", []> {
+  let summary = "Equivalent to "
+                "`MPI_Recv(&buf, count, datatype, source, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE)`";
+
+  let arguments = (
+    ins AnyTensor : $inbuf,
+    TensorOf<[I32]> : $count,
+    TensorOf<[I32]> : $source,
+    TensorOf<[I32]> : $tag,
+    EnzymeXLA_MPIDatatypeAttr:$datatype
+  );
+
+  let results = (
+    outs AnyTensor : $outbuf
+  );
+
+  let assemblyFormat = "`(` operands `)` attr-dict `:` functional-type(operands, results)";
+}
+
+def MPIIsendOp : EnzymeXLA_Op<"mpi.isend", []> {
+  let summary = "Equivalent to "
+                "`MPI_Isend(&buf, count, datatype, dest, tag, MPI_COMM_WORLD, &request)`";
+
+  let arguments = (
+    ins AnyTensor : $buf,
+    TensorOf<[I32]> : $count,
+    TensorOf<[I32]> : $dest,
+    TensorOf<[I32]> : $tag,
+    EnzymeXLA_MPIDatatypeAttr:$datatype
+  );
+
+  let results = (
+    outs TensorOf<[I64]> : $request
+  );
+
+  let assemblyFormat = "`(` operands `)` attr-dict `:` functional-type(operands, results)";
+}
+
+def MPIIrecvOp : EnzymeXLA_Op<"mpi.irecv", []> {
+  let summary = "Equivalent to "
+                "`MPI_Irecv(&buf, count, datatype, source, tag, MPI_COMM_WORLD, &request)`";
+
+  let arguments = (
+    ins AnyTensor : $inbuf,
+    TensorOf<[I32]> : $count,
+    TensorOf<[I32]> : $source,
+    TensorOf<[I32]> : $tag,
+    EnzymeXLA_MPIDatatypeAttr:$datatype
+  );
+
+  let results = (
+    outs AnyTensor : $outbuf,
+    TensorOf<[I64]> : $request
+  );
+
+  let assemblyFormat = "`(` operands `)` attr-dict `:` functional-type(operands, results)";
+}
+
+def MPIWaitOp : EnzymeXLA_Op<"mpi.wait", []> {
+  let summary = "Equivalent to "
+                "`MPI_Wait(&request, &status)`";
+  let arguments = (ins TensorOf<[I64]> : $request);
+  let assemblyFormat = "`(` operands `)` attr-dict `:` type(operands)";
+}
+
+def MPIAllreduceOp : EnzymeXLA_Op<"mpi.allreduce", []> {
+  let summary = "Equivalent to "
+                "`MPI_Allreduce(&sendbuf, &recvbuf, count, datatype, op, MPI_COMM_WORLD)`";
+
+  let arguments = (
+    ins AnyTensor : $sendbuf,
+    AnyTensor : $inbuf,
+    TensorOf<[I32]> : $count,
+    EnzymeXLA_MPIDatatypeAttr:$datatype,
+    EnzymeXLA_MPIOpAttr:$op
+  );
+
+  let results = (
+    outs AnyTensor : $outbuf
+  );
+
+  let assemblyFormat = "`(` operands `)` attr-dict `:` functional-type(operands, results)";
 }
 
 #endif // ENZYMEXLA_OPS

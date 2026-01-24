@@ -10,6 +10,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/Value.h>
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -73,6 +74,14 @@ template <> inline Attribute makeAttr(mlir::Type elemType, llvm::APFloat val) {
         TT, ArrayRef(makeAttr<llvm::APFloat>(TT.getElementType(), val)));
 
   return FloatAttr::get(elemType, val);
+}
+
+template <> inline Attribute makeAttr(mlir::Type elemType, llvm::APInt val) {
+  if (auto TT = dyn_cast<RankedTensorType>(elemType))
+    return SplatElementsAttr::get(
+        TT, ArrayRef(makeAttr<llvm::APInt>(TT.getElementType(), val)));
+
+  return IntegerAttr::get(elemType, val);
 }
 
 // matcher for complex numbers. should probably be upstreamed at some point.
@@ -690,6 +699,37 @@ public:
     return state;
   }
 
+protected:
+  template <typename ItTy>
+  State recursivelyCheckOperands(SmallVectorImpl<Value> &localtodo,
+                                 ItTy operands, bool skipIntegerEltypes) {
+    assert(!operands.empty() && "expected operands to not be empty");
+
+    bool allOperandsGuaranteed = true;
+    for (auto operand : operands) {
+      if (skipIntegerEltypes) {
+        if (auto TT = dyn_cast<TensorType>(operand.getType())) {
+          if (TT.getElementType().isInteger()) {
+            continue;
+          }
+        }
+      }
+
+      auto found = valueCache.find(operand);
+      if (found != valueCache.end()) {
+        if (found->second) {
+          continue;
+        }
+        return State::NOTGUARANTEED;
+      }
+
+      localtodo.push_back(operand);
+      allOperandsGuaranteed = false;
+    }
+
+    return allOperandsGuaranteed ? State::GUARANTEED : State::PENDING;
+  }
+
 private:
   State
   GuaranteedAnalysisResultToState(enzymexla::GuaranteedAnalysisResult val) {
@@ -951,14 +991,101 @@ absl::Status detectDiagonalTensor(stablehlo::ScatterOp scatterOp,
                                   mlir::Value *outUpdates);
 absl::Status detectDiagonalTensor(stablehlo::ScatterOp scatterOp);
 
+// Tensor indexing utilities for multi-dimensional arrays
+
+// Compute row-major strides for a given shape
+inline llvm::SmallVector<int64_t>
+computeStrides(llvm::ArrayRef<int64_t> shape) {
+  int64_t rank = shape.size();
+  llvm::SmallVector<int64_t> strides(rank, 1);
+  for (int64_t i = rank - 2; i >= 0; --i) {
+    strides[i] = strides[i + 1] * shape[i + 1];
+  }
+  return strides;
+}
+
+// Convert a linear index to multi-dimensional indices
+inline void linearToMultiIndex(int64_t linearIdx,
+                               llvm::ArrayRef<int64_t> strides,
+                               llvm::SmallVectorImpl<int64_t> &indices) {
+  indices.resize(strides.size());
+  for (size_t d = 0; d < strides.size(); d++) {
+    indices[d] = linearIdx / strides[d];
+    linearIdx = linearIdx % strides[d];
+  }
+}
+
+// Convert multi-dimensional indices to a linear index
+inline int64_t multiToLinearIndex(llvm::ArrayRef<int64_t> indices,
+                                  llvm::ArrayRef<int64_t> strides) {
+  int64_t linearIdx = 0;
+  for (size_t d = 0; d < strides.size(); d++) {
+    linearIdx += indices[d] * strides[d];
+  }
+  return linearIdx;
+}
+
 struct IotaLikeTensor {
-  int64_t start;
+  mlir::TypedAttr start;
   int64_t dimension;
-  int64_t scale = 1; // multiplicative factor applied to the iota
+  mlir::TypedAttr scale; // multiplicative factor applied to the iota
   mlir::RankedTensorType tensorType;
 };
 
+std::optional<IotaLikeTensor> detectIotaLikeTensor(DenseElementsAttr attr);
 std::optional<IotaLikeTensor> detectIotaLikeTensor(mlir::Value tensor);
+
+// Represents a constant tensor that can be expressed as
+//   pad(innerTensor, paddingValue, lowPadding, highPadding,
+//   interiorPadding=[0,...])
+struct PaddedTensor {
+  mlir::DenseElementsAttr innerTensorAttr; // The smaller constant tensor
+  mlir::Attribute paddingValue;            // The padding value (scalar)
+  llvm::SmallVector<int64_t> lowPadding;   // Padding at the start of each dim
+  llvm::SmallVector<int64_t> highPadding;  // Padding at the end of each dim
+  mlir::RankedTensorType resultType;       // The resulting padded tensor type
+};
+
+std::optional<PaddedTensor> detectPaddedTensor(mlir::DenseElementsAttr attr);
+
+// Helper to check if a TypedAttr is zero
+inline bool isZeroAttr(mlir::TypedAttr attr) {
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getValue().isZero();
+  if (auto floatAttr = llvm::dyn_cast<mlir::FloatAttr>(attr))
+    return floatAttr.getValue().isZero();
+  return false;
+}
+
+// Helper to check if a TypedAttr is one
+inline bool isOneAttr(mlir::TypedAttr attr) {
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return intAttr.getValue() == 1;
+  if (auto floatAttr = llvm::dyn_cast<mlir::FloatAttr>(attr)) {
+    llvm::APFloat one(floatAttr.getValue().getSemantics(), 1);
+    return floatAttr.getValue().bitwiseIsEqual(one);
+  }
+  return false;
+}
+
+// Helper to get a double value from a TypedAttr
+inline std::optional<double> getDoubleFromAttr(mlir::TypedAttr attr) {
+  if (auto intAttr = llvm::dyn_cast<mlir::IntegerAttr>(attr))
+    return static_cast<double>(intAttr.getValue().getSExtValue());
+  if (auto floatAttr = llvm::dyn_cast<mlir::FloatAttr>(attr))
+    return floatAttr.getValueAsDouble();
+  return std::nullopt;
+}
+
+// Helper to create a TypedAttr from a double value using the given type
+inline mlir::TypedAttr createAttrFromDouble(mlir::MLIRContext *ctx,
+                                            mlir::Type elemType, double value) {
+  if (auto intType = llvm::dyn_cast<mlir::IntegerType>(elemType))
+    return mlir::IntegerAttr::get(intType, static_cast<int64_t>(value));
+  if (auto floatType = llvm::dyn_cast<mlir::FloatType>(elemType))
+    return mlir::FloatAttr::get(floatType, value);
+  return nullptr;
+}
 
 // TODO: we can do a full analysis and return if the access is on a specific set
 // of diagonals. Checks that all accesses for this Op and its users thereoff are
@@ -977,6 +1104,9 @@ namespace stablehlo {
 stablehlo::GatherDimensionNumbersAttr
 getGatherDims(mlir::MLIRContext *ctx,
               stablehlo::ScatterDimensionNumbersAttr scatterDimNumbers);
+
+bool isSetindexBlock(mlir::Block *block,
+                     std::function<bool(stablehlo::ReturnOp retOp)> fn);
 
 bool isSetindexBlock(mlir::Block *block);
 bool isConstantSetindexBlock(mlir::Block *block,
@@ -1068,120 +1198,6 @@ bool isOnlyOpConstantBlock(mlir::Block *block,
   // The returned value should be the result of the addition
   return stablehloReturnOp.getOperand(0) == op.getResult();
 }
-
-struct CheckCommonReduceOp {
-public:
-  bool isAddReduce;
-  bool isMinReduce;
-  bool isMaxReduce;
-  bool isMulReduce;
-  bool isAndReduce;
-  bool isOrReduce;
-  bool isXorReduce;
-
-  CheckCommonReduceOp(stablehlo::ReduceOp op) {
-    auto &region = op.getRegion();
-    if (region.getBlocks().size() != 1) {
-      isAddReduce = false;
-      isMinReduce = false;
-      isMaxReduce = false;
-      isMulReduce = false;
-      isAndReduce = false;
-      isOrReduce = false;
-      isXorReduce = false;
-      return;
-    }
-
-    auto &block = region.getBlocks().front();
-    isAddReduce = isOnlyOpBlock<stablehlo::AddOp, true, false>(&block);
-    isMinReduce = isOnlyOpBlock<stablehlo::MinOp, true, false>(&block);
-    isMaxReduce = isOnlyOpBlock<stablehlo::MaxOp, true, false>(&block);
-    isMulReduce = isOnlyOpBlock<stablehlo::MulOp, true, false>(&block);
-    isAndReduce = isOnlyOpBlock<stablehlo::AndOp, true, false>(&block);
-    isOrReduce = isOnlyOpBlock<stablehlo::OrOp, true, false>(&block);
-    isXorReduce = isOnlyOpBlock<stablehlo::XorOp, true, false>(&block);
-  }
-};
-
-struct CheckCommonScatterOp {
-public:
-  bool isSetindexScatter;
-  bool isConstantSetindexScatter;
-
-  bool isAddScatter;
-  bool isMinScatter;
-  bool isMaxScatter;
-  bool isMulScatter;
-  bool isAndScatter;
-  bool isOrScatter;
-  bool isXorScatter;
-  bool isSubScatter;
-
-  bool isMulConstantUpdateScatter;
-  bool isMulConstantInputScatter;
-  bool isAddConstantUpdateScatter;
-  bool isAddConstantInputScatter;
-  SplatElementsAttr constant;
-
-  CheckCommonScatterOp(stablehlo::ScatterOp op) {
-    auto &updateComputation = op.getUpdateComputation();
-
-    if (!updateComputation.hasOneBlock()) {
-      isSetindexScatter = false;
-      isConstantSetindexScatter = false;
-      isAddScatter = false;
-      isMinScatter = false;
-      isMaxScatter = false;
-      isMulScatter = false;
-      isAndScatter = false;
-      isOrScatter = false;
-      isXorScatter = false;
-      isSubScatter = false;
-
-      isMulConstantUpdateScatter = false;
-      isAddConstantUpdateScatter = false;
-      isMulConstantInputScatter = false;
-      isAddConstantInputScatter = false;
-      return;
-    }
-
-    auto &block = updateComputation.front();
-    isSetindexScatter = isSetindexBlock(&block);
-    isConstantSetindexScatter = isConstantSetindexBlock(&block, constant);
-    isAddScatter = isOnlyOpBlock<stablehlo::AddOp, true, false>(&block);
-    isMulScatter = isOnlyOpBlock<stablehlo::MulOp, true, false>(&block);
-    isMinScatter = isOnlyOpBlock<stablehlo::MinOp, true, false>(&block);
-    isMaxScatter = isOnlyOpBlock<stablehlo::MaxOp, true, false>(&block);
-    isAndScatter = isOnlyOpBlock<stablehlo::AndOp, true, false>(&block);
-    isOrScatter = isOnlyOpBlock<stablehlo::OrOp, true, false>(&block);
-    isXorScatter = isOnlyOpBlock<stablehlo::XorOp, true, false>(&block);
-    isSubScatter = isOnlyOpBlock<stablehlo::SubtractOp, false, true>(&block);
-
-    isMulConstantUpdateScatter =
-        isOnlyOpConstantBlock<stablehlo::MulOp, 0>(&block, constant);
-    if (!isMulConstantUpdateScatter) {
-      isMulConstantInputScatter =
-          isOnlyOpConstantBlock<stablehlo::MulOp, 1>(&block, constant);
-      if (!isMulConstantInputScatter) {
-        isAddConstantUpdateScatter =
-            isOnlyOpConstantBlock<stablehlo::AddOp, 0>(&block, constant);
-        if (!isAddConstantUpdateScatter) {
-          isAddConstantInputScatter =
-              isOnlyOpConstantBlock<stablehlo::AddOp, 1>(&block, constant);
-        } else {
-          isAddConstantInputScatter = false;
-        }
-      } else {
-        isAddConstantUpdateScatter = false;
-        isAddConstantInputScatter = false;
-      }
-    } else {
-      isAddConstantUpdateScatter = false;
-      isAddConstantInputScatter = false;
-      isMulConstantInputScatter = false;
-    }
-  }
-};
 
 SmallVector<int64_t> computeGatherSliceSizes(stablehlo::ScatterOp &scatterOp);
 
@@ -1379,10 +1395,154 @@ DEFINE_BINARY_OP_CREATE(AddOp)
 DEFINE_BINARY_OP_CREATE(MulOp)
 DEFINE_BINARY_OP_CREATE(SubtractOp)
 DEFINE_BINARY_OP_CREATE(DivOp)
+DEFINE_BINARY_OP_CREATE(MinOp)
+DEFINE_BINARY_OP_CREATE(MaxOp)
+DEFINE_BINARY_OP_CREATE(AndOp)
+DEFINE_BINARY_OP_CREATE(OrOp)
+DEFINE_BINARY_OP_CREATE(XorOp)
 
 // walk back starting from `input` and track the operations to determine if
 // only part of the matrix is populated.
 bool IsTensorFilled(Value input);
+
+// Enum representing the type of reduce operation
+enum class ReduceOpKind { Unknown, Add, Min, Max, Mul, And, Or, Xor };
+
+template <typename OpTy> struct CheckCommonReduceLikeOp {
+public:
+  ReduceOpKind kind;
+
+  CheckCommonReduceLikeOp(OpTy op) {
+    auto &region = op.getBody();
+    if (region.getBlocks().size() != 1) {
+      kind = ReduceOpKind::Unknown;
+      return;
+    }
+
+    auto &block = region.getBlocks().front();
+    if (isOnlyOpBlock<stablehlo::AddOp, true, false>(&block)) {
+      kind = ReduceOpKind::Add;
+    } else if (isOnlyOpBlock<stablehlo::MinOp, true, false>(&block)) {
+      kind = ReduceOpKind::Min;
+    } else if (isOnlyOpBlock<stablehlo::MaxOp, true, false>(&block)) {
+      kind = ReduceOpKind::Max;
+    } else if (isOnlyOpBlock<stablehlo::MulOp, true, false>(&block)) {
+      kind = ReduceOpKind::Mul;
+    } else if (isOnlyOpBlock<stablehlo::AndOp, true, false>(&block)) {
+      kind = ReduceOpKind::And;
+    } else if (isOnlyOpBlock<stablehlo::OrOp, true, false>(&block)) {
+      kind = ReduceOpKind::Or;
+    } else if (isOnlyOpBlock<stablehlo::XorOp, true, false>(&block)) {
+      kind = ReduceOpKind::Xor;
+    } else {
+      kind = ReduceOpKind::Unknown;
+    }
+  }
+
+  bool isCommutativeOp() const { return kind != ReduceOpKind::Unknown; }
+
+  Value createEquivalentOperation(
+      OpBuilder &builder, Location loc, Value lhs, Value rhs,
+      std::optional<sdy::TensorShardingPerValueAttr> sharding = std::nullopt) {
+    switch (kind) {
+    case ReduceOpKind::Add:
+      return AddOpCreate(builder, loc, lhs, rhs, sharding);
+    case ReduceOpKind::Min:
+      return MinOpCreate(builder, loc, lhs, rhs, sharding);
+    case ReduceOpKind::Max:
+      return MaxOpCreate(builder, loc, lhs, rhs, sharding);
+    case ReduceOpKind::Mul:
+      return MulOpCreate(builder, loc, lhs, rhs, sharding);
+    case ReduceOpKind::And:
+      return AndOpCreate(builder, loc, lhs, rhs, sharding);
+    case ReduceOpKind::Or:
+      return OrOpCreate(builder, loc, lhs, rhs, sharding);
+    case ReduceOpKind::Xor:
+      return XorOpCreate(builder, loc, lhs, rhs, sharding);
+    default:
+      llvm_unreachable("Invalid reduce op");
+    }
+  }
+};
+
+// Type alias for backward compatibility
+using CheckCommonReduceOp = CheckCommonReduceLikeOp<stablehlo::ReduceOp>;
+using CheckCommonReduceWindowOp =
+    CheckCommonReduceLikeOp<stablehlo::ReduceWindowOp>;
+
+// Enum representing the type of scatter operation
+enum class ScatterOpKind {
+  Unknown,
+  Setindex,
+  ConstantSetindex,
+  Add,
+  Min,
+  Max,
+  Mul,
+  And,
+  Or,
+  Xor,
+  Sub,
+  MulConstantUpdate,
+  MulConstantInput,
+  AddConstantUpdate,
+  AddConstantInput
+};
+
+struct CheckCommonScatterOp {
+public:
+  ScatterOpKind kind;
+  SplatElementsAttr constant;
+
+  CheckCommonScatterOp(stablehlo::ScatterOp op) {
+    auto &updateComputation = op.getUpdateComputation();
+
+    if (!updateComputation.hasOneBlock()) {
+      kind = ScatterOpKind::Unknown;
+      return;
+    }
+
+    auto &block = updateComputation.front();
+
+    // Check for constant operations first (since they are more specific)
+    if (isOnlyOpConstantBlock<stablehlo::MulOp, 0>(&block, constant)) {
+      kind = ScatterOpKind::MulConstantUpdate;
+    } else if (isOnlyOpConstantBlock<stablehlo::MulOp, 1>(&block, constant)) {
+      kind = ScatterOpKind::MulConstantInput;
+    } else if (isOnlyOpConstantBlock<stablehlo::AddOp, 0>(&block, constant)) {
+      kind = ScatterOpKind::AddConstantUpdate;
+    } else if (isOnlyOpConstantBlock<stablehlo::AddOp, 1>(&block, constant)) {
+      kind = ScatterOpKind::AddConstantInput;
+    } else if (isConstantSetindexBlock(&block, constant)) {
+      kind = ScatterOpKind::ConstantSetindex;
+    } else if (isSetindexBlock(&block)) {
+      kind = ScatterOpKind::Setindex;
+    } else if (isOnlyOpBlock<stablehlo::AddOp, true, false>(&block)) {
+      kind = ScatterOpKind::Add;
+    } else if (isOnlyOpBlock<stablehlo::MulOp, true, false>(&block)) {
+      kind = ScatterOpKind::Mul;
+    } else if (isOnlyOpBlock<stablehlo::MinOp, true, false>(&block)) {
+      kind = ScatterOpKind::Min;
+    } else if (isOnlyOpBlock<stablehlo::MaxOp, true, false>(&block)) {
+      kind = ScatterOpKind::Max;
+    } else if (isOnlyOpBlock<stablehlo::AndOp, true, false>(&block)) {
+      kind = ScatterOpKind::And;
+    } else if (isOnlyOpBlock<stablehlo::OrOp, true, false>(&block)) {
+      kind = ScatterOpKind::Or;
+    } else if (isOnlyOpBlock<stablehlo::XorOp, true, false>(&block)) {
+      kind = ScatterOpKind::Xor;
+    } else if (isOnlyOpBlock<stablehlo::SubtractOp, false, true>(&block)) {
+      kind = ScatterOpKind::Sub;
+    } else {
+      kind = ScatterOpKind::Unknown;
+    }
+  }
+};
+
+void ExtractBlockIntoFunction(Block *block, ModuleOp modOp, func::FuncOp &func,
+                              llvm::SetVector<Value> &capturedValues,
+                              llvm::SmallVectorImpl<Type> &resultTypes,
+                              OpBuilder &builder);
 
 } // namespace stablehlo
 
